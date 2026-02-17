@@ -1,81 +1,85 @@
 import os
+import time
 import uuid
 import base64
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Literal, List, Dict
 
-from dotenv import load_dotenv
-from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
+from fastapi import FastAPI, Form, HTTPException, Request
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from jinja2 import Environment, FileSystemLoader, select_autoescape
+from dotenv import load_dotenv
 from openai import OpenAI
 
 load_dotenv()
 
-API_KEY = os.getenv("OPENAI_API_KEY")
-if not API_KEY:
-    raise RuntimeError("Defina OPENAI_API_KEY nas variáveis de ambiente do Render (não no GitHub).")
-
-client = OpenAI(api_key=API_KEY)
-
 BASE_DIR = Path(__file__).parent
 MEDIA_DIR = BASE_DIR / "media"
-MEDIA_DIR.mkdir(exist_ok=True)
-
+IMG_DIR = MEDIA_DIR / "images"
+VID_DIR = MEDIA_DIR / "videos"
 TEMPLATES_DIR = BASE_DIR / "templates"
+
+IMG_DIR.mkdir(parents=True, exist_ok=True)
+VID_DIR.mkdir(parents=True, exist_ok=True)
+TEMPLATES_DIR.mkdir(parents=True, exist_ok=True)
+
 env = Environment(
     loader=FileSystemLoader(str(TEMPLATES_DIR)),
-    autoescape=select_autoescape(["html", "xml"])
+    autoescape=select_autoescape(["html", "xml"]),
 )
 
-app = FastAPI(title="Ultra Real AI - Personagem + Imagens + Vídeos")
-
+app = FastAPI(title="Estúdio Ultra Real IA (Imagem + Vídeo)")
 app.mount("/media", StaticFiles(directory=str(MEDIA_DIR)), name="media")
 
 
 # -----------------------------
 # Utilitários
 # -----------------------------
-def save_b64_image_to_file(b64_json: str, out_path: Path) -> None:
+def now_id(prefix: str) -> str:
+    return f"{prefix}_{int(time.time())}_{uuid.uuid4().hex[:8]}"
+
+def save_b64_to_png(b64_json: str, out_path: Path) -> None:
     raw = base64.b64decode(b64_json)
     out_path.write_bytes(raw)
 
-def id_file(ext: str) -> str:
-    return f"{uuid.uuid4().hex}{ext}"
+def get_client() -> OpenAI:
+    key = os.getenv("OPENAI_API_KEY", "").strip()
+    if not key:
+        raise HTTPException(
+            status_code=500,
+            detail="OPENAI_API_KEY não configurada no Render. Vá em Settings → Environment e adicione OPENAI_API_KEY.",
+        )
+    return OpenAI(api_key=key)
 
-def ultra_real_prompt(base: str) -> str:
-    # Observação: “poros e rugas” é totalmente permitido.
-    # Só evite pedir para copiar rosto de pessoa real famosa/terceiro.
+def list_gallery() -> Dict[str, List[Dict[str, str]]]:
+    images = sorted([p.name for p in IMG_DIR.glob("*.png")], reverse=True)
+    videos = sorted([p.name for p in VID_DIR.glob("*.mp4")], reverse=True)
+    return {
+        "images": [{"name": n, "url": f"/media/images/{n}", "download": f"/download/images/{n}"} for n in images],
+        "videos": [{"name": n, "url": f"/media/videos/{n}", "download": f"/download/videos/{n}"} for n in videos],
+    }
+
+def ultra_real_style() -> str:
     return (
-        base.strip()
-        + "\n\nEstilo: fotografia hiper-realista, pele real com poros visíveis, microtextura, sinais de expressão sutis, "
-          "iluminação natural, lente 85mm, profundidade de campo suave, alta nitidez no rosto, cores naturais."
+        "fotografia hiper-realista, pele humana real com poros visíveis, microtextura, "
+        "micro imperfeições naturais, sinais de expressão sutis, detalhes finos, "
+        "iluminação natural/cinematográfica realista, lente 85mm, profundidade de campo suave, "
+        "cores naturais, alta nitidez no rosto, sem aparência de CGI, sem cartoon, sem ilustração"
     )
 
-def safe_read_upload(file: UploadFile) -> bytes:
-    content = file.file.read()
-    if not content:
-        raise HTTPException(400, "Arquivo vazio.")
-    return content
+def character_ref_file(character_id: str) -> Path:
+    return IMG_DIR / f"{character_id}.ref.txt"
 
-
-# -----------------------------
-# “Banco” simples (arquivo)
-# -----------------------------
-# Para demo: guardamos um arquivo TXT por personagem com o caminho da imagem de referência.
-# Em produção: use SQLite ou Postgres.
-def character_ref_path(character_id: str) -> Path:
-    return MEDIA_DIR / f"{character_id}.ref.txt"
-
-def set_character_ref(character_id: str, ref_image_filename: str) -> None:
-    character_ref_path(character_id).write_text(ref_image_filename, encoding="utf-8")
+def set_character_ref(character_id: str, filename: str) -> None:
+    character_ref_file(character_id).write_text(filename, encoding="utf-8")
 
 def get_character_ref(character_id: str) -> Optional[str]:
-    p = character_ref_path(character_id)
+    p = character_ref_file(character_id)
     if not p.exists():
         return None
-    return p.read_text(encoding="utf-8").strip() or None
+    v = p.read_text(encoding="utf-8").strip()
+    return v or None
 
 
 # -----------------------------
@@ -84,80 +88,91 @@ def get_character_ref(character_id: str) -> Optional[str]:
 @app.get("/", response_class=HTMLResponse)
 def home(request: Request):
     tpl = env.get_template("index.html")
-
-    # Lista imagens e vídeos gerados
-    items = sorted([p.name for p in MEDIA_DIR.glob("*") if p.suffix.lower() in {".png", ".jpg", ".jpeg", ".mp4"}])
-    return tpl.render(items=items)
+    has_key = bool(os.getenv("OPENAI_API_KEY", "").strip())
+    return tpl.render(has_key=has_key)
 
 
 # -----------------------------
-# 1) Criar personagem (imagem-base)
+# Galeria / Download
 # -----------------------------
-@app.post("/api/character/create")
-def create_character(
-    description: str = Form(...),
-    size: str = Form("1024x1024"),
+@app.get("/api/galeria")
+def api_galeria():
+    return JSONResponse(list_gallery())
+
+@app.get("/download/{kind}/{filename}")
+def download(kind: str, filename: str):
+    if kind not in ("images", "videos"):
+        raise HTTPException(400, "Tipo inválido.")
+    base = IMG_DIR if kind == "images" else VID_DIR
+    path = base / filename
+    if not path.exists():
+        raise HTTPException(404, "Arquivo não encontrado.")
+    return FileResponse(path, filename=filename)
+
+
+# -----------------------------
+# 1) Criar personagem (imagem base)
+# -----------------------------
+@app.post("/api/personagem/criar")
+def criar_personagem(
+    nome: str = Form(...),
+    descricao: str = Form(...),
+    size: Literal["1024x1024", "1536x1024", "1024x1536"] = Form("1024x1024"),
 ):
-    """
-    Cria um personagem IA (imagem base) e gera um character_id.
-    """
+    client = get_client()
+
     character_id = uuid.uuid4().hex
 
-    prompt = ultra_real_prompt(
-        f"Crie um retrato ultra realista de um personagem original (não baseado em pessoa real). {description}"
+    prompt = (
+        f"Crie um retrato fotográfico ultra-realista de um personagem IA fictício (não baseado em pessoa real). "
+        f"Nome do personagem: {nome}. "
+        f"Descrição: {descricao}. "
+        f"Foco: rosto em destaque, identidade facial consistente, detalhes realistas da pele. "
+        f"Estilo: {ultra_real_style()}."
+        f"Fundo simples e limpo, sem texto, sem marca d'água."
     )
 
-    # Geração de imagem (b64_json)
     result = client.images.generate(
         model="gpt-image-1",
         prompt=prompt,
         size=size
     )
 
-    b64_json = result.data[0].b64_json
-    filename = id_file(".png")
-    out_path = MEDIA_DIR / filename
-    save_b64_image_to_file(b64_json, out_path)
+    b64 = result.data[0].b64_json
+    filename = f"{now_id('personagem')}.png"
+    out_path = IMG_DIR / filename
+    save_b64_to_png(b64, out_path)
 
-    # Define essa imagem como referência do personagem
     set_character_ref(character_id, filename)
 
-    return {
-        "character_id": character_id,
-        "ref_image": f"/media/{filename}",
-        "download": f"/api/download/{filename}"
-    }
+    return {"character_id": character_id, "image_name": filename, "image_url": f"/media/images/{filename}"}
 
 
 # -----------------------------
-# 2) Gerar nova imagem mantendo o mesmo rosto
+# 2) Variação (mesmo rosto + novo ambiente)
 # -----------------------------
-@app.post("/api/character/{character_id}/image")
-def generate_image_same_face(
-    character_id: str,
-    scene: str = Form(...),
-    size: str = Form("1024x1024"),
+@app.post("/api/personagem/variacao")
+def gerar_variacao(
+    character_id: str = Form(...),
+    base_image: str = Form(...),  # nome do arquivo .png da galeria
+    cena: str = Form(...),
+    size: Literal["1024x1024", "1536x1024", "1024x1536"] = Form("1024x1024"),
 ):
-    """
-    Gera uma nova imagem usando a imagem do personagem como referência (image-to-image).
-    Isso é o que ajuda a manter o mesmo rosto.
-    """
-    ref_filename = get_character_ref(character_id)
-    if not ref_filename:
-        raise HTTPException(404, "Personagem não encontrado. Crie o personagem primeiro.")
+    client = get_client()
 
-    ref_path = MEDIA_DIR / ref_filename
+    base_name = base_image.split("/")[-1]
+    ref_path = IMG_DIR / base_name
     if not ref_path.exists():
-        raise HTTPException(500, "Referência do personagem não encontrada no servidor.")
+        raise HTTPException(404, "Imagem base não encontrada na galeria.")
 
-    prompt = ultra_real_prompt(
-        "Use a imagem fornecida como referência do mesmo personagem (mesmo rosto). "
-        f"Crie esta nova cena: {scene}. "
-        "Mantenha identidade facial consistente (mesmo formato do rosto, olhos, nariz e boca), "
-        "mas permita mudanças de roupa, pose e ambiente."
+    prompt = (
+        "Use a imagem enviada como referência do MESMO personagem (mesmo rosto). "
+        f"Nova cena/ambiente: {cena}. "
+        "Permita alterações de roupa/pose/cenário, mas mantenha a identidade facial consistente. "
+        f"Estilo: {ultra_real_style()}. Sem texto, sem marca d'água."
     )
 
-    # Tenta image-to-image (edits). Se o modelo/conta não suportar, cai para text-only (menos consistente).
+    # Tenta editar com imagem de referência (melhor consistência)
     try:
         with open(ref_path, "rb") as img:
             result = client.images.edit(
@@ -166,84 +181,41 @@ def generate_image_same_face(
                 prompt=prompt,
                 size=size
             )
-        b64_json = result.data[0].b64_json
+        b64 = result.data[0].b64_json
         method = "reference-image"
     except Exception:
-        # fallback (pode variar mais o rosto)
+        # fallback: só texto (pode variar mais o rosto)
         result = client.images.generate(
             model="gpt-image-1",
             prompt=prompt,
             size=size
         )
-        b64_json = result.data[0].b64_json
+        b64 = result.data[0].b64_json
         method = "text-fallback"
 
-    filename = id_file(".png")
-    out_path = MEDIA_DIR / filename
-    save_b64_image_to_file(b64_json, out_path)
+    filename = f"{now_id('variacao')}.png"
+    out_path = IMG_DIR / filename
+    save_b64_to_png(b64, out_path)
 
-    return {
-        "character_id": character_id,
-        "method": method,
-        "image": f"/media/{filename}",
-        "download": f"/api/download/{filename}"
-    }
+    return {"method": method, "image_name": filename, "image_url": f"/media/images/{filename}"}
 
 
 # -----------------------------
-# 3) Gerar vídeo com o mesmo rosto (rota pronta)
+# 3) Vídeo (rota pronta – depende do endpoint disponível na sua conta)
 # -----------------------------
-@app.post("/api/character/{character_id}/video")
-def generate_video_same_face(
-    character_id: str,
-    prompt: str = Form(...),
+@app.post("/api/personagem/video")
+def gerar_video(
+    base_image: str = Form(...),
+    prompt_video: str = Form(...),
 ):
     """
-    Vídeo depende de acesso ao endpoint de vídeo na sua conta.
-    Mantemos a rota pronta. Se sua conta não tiver, retorna erro explicando.
+    Mantém a rota pronta. Se sua conta tiver acesso ao endpoint de vídeo, dá para ativar aqui.
+    Se não tiver, retornamos um aviso amigável.
     """
-    ref_filename = get_character_ref(character_id)
-    if not ref_filename:
-        raise HTTPException(404, "Personagem não encontrado. Crie o personagem primeiro.")
+    _ = get_client()  # só valida chave
 
-    ref_path = MEDIA_DIR / ref_filename
-    if not ref_path.exists():
-        raise HTTPException(500, "Referência do personagem não encontrada no servidor.")
-
-    # IMPORTANTE:
-    # Dependendo do acesso da sua conta, o endpoint e assinatura podem mudar.
-    # Por isso fazemos um try e damos uma mensagem clara.
-    try:
-        # Exemplo conceitual: usar a imagem como primeiro frame / referência.
-        # Se sua conta suportar, adapte este trecho conforme o modelo/endpoints disponíveis.
-        # (Se não suportar, dá exceção e a gente explica.)
-        with open(ref_path, "rb") as img:
-            video_job = client.videos.generate(  # pode não existir na sua SDK/conta
-                model="sora",
-                prompt=prompt,
-                image=img
-            )
-
-        # Se retornar um URL/bytes, você salva em .mp4 dentro de /media.
-        # Como isso varia por conta/modelo, deixamos a mensagem.
-        return {"status": "ok", "detail": "Vídeo iniciado. (Ajuste o download conforme retorno do seu endpoint)."}
-    except Exception as e:
-        raise HTTPException(
-            501,
-            "Sua conta/SDK ainda não tem o endpoint de vídeo configurado aqui. "
-            "O app já está pronto para imagens com rosto consistente. "
-            "Se você quiser, eu adapto esta rota para o provedor de vídeo que você escolher (ou para o endpoint de vídeo que sua conta tiver). "
-            f"Erro técnico: {type(e).__name__}"
-        )
-
-
-# -----------------------------
-# Downloads
-# -----------------------------
-@app.get("/api/download/{filename}")
-def download_file(filename: str):
-    path = MEDIA_DIR / filename
-    if not path.exists():
-        raise HTTPException(404, "Arquivo não encontrado.")
-    return FileResponse(path, filename=filename)
-  
+    raise HTTPException(
+        status_code=501,
+        detail="Geração de vídeo: sua conta/endpoint ainda não está ativado neste app. "
+               "Se você me disser qual provedor/modelo de vídeo você quer usar, eu integro (OpenAI se disponível, ou outro)."
+    )
